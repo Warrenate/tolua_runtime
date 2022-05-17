@@ -1,0 +1,2 @@
+Proto库引用：https://github.com/starwing/lua-protobuf
+版本：Release-0.3.4
