@@ -40,9 +40,8 @@
 #include <string.h>
 #include <math.h>
 #include <limits.h>
-#include "lua.h"
-#include "lualib.h"
-#include "lauxlib.h"
+#include <lua.h>
+#include <lauxlib.h>
 
 #include "strbuf.h"
 #include "fpconv.h"
@@ -52,7 +51,13 @@
 #endif
 
 #ifndef CJSON_VERSION
-#define CJSON_VERSION   "2.1.0"
+#define CJSON_VERSION   "2.1devel"
+#endif
+
+#ifdef _MSC_VER
+#define CJSON_EXPORT    __declspec(dllexport)
+#else
+#define CJSON_EXPORT    extern
 #endif
 
 /* Workaround for Solaris platforms missing isinf() */
@@ -69,6 +74,7 @@
 #define DEFAULT_DECODE_INVALID_NUMBERS 1
 #define DEFAULT_ENCODE_KEEP_BUFFER 1
 #define DEFAULT_ENCODE_NUMBER_PRECISION 14
+#define DEFAULT_ENCODE_EMPTY_TABLE_AS_ARRAY 0
 
 #ifdef DISABLE_INVALID_NUMBERS
 #undef DEFAULT_DECODE_INVALID_NUMBERS
@@ -82,6 +88,7 @@ typedef enum {
     T_ARR_END,
     T_STRING,
     T_NUMBER,
+    T_INTEGER,
     T_BOOLEAN,
     T_NULL,
     T_COLON,
@@ -99,6 +106,7 @@ static const char *json_token_type_name[] = {
     "T_ARR_END",
     "T_STRING",
     "T_NUMBER",
+    "T_INTEGER",
     "T_BOOLEAN",
     "T_NULL",
     "T_COLON",
@@ -125,6 +133,7 @@ typedef struct {
     int encode_invalid_numbers;     /* 2 => Encode as "null" */
     int encode_number_precision;
     int encode_keep_buffer;
+    int encode_empty_table_as_array;
 
     int decode_invalid_numbers;
     int decode_max_depth;
@@ -144,6 +153,7 @@ typedef struct {
     union {
         const char *string;
         double number;
+        lua_Integer integer;
         int boolean;
     } value;
     int string_len;
@@ -194,7 +204,7 @@ static json_config_t *json_fetch_config(lua_State *l)
 {
     json_config_t *cfg;
 
-    cfg = lua_touserdata(l, lua_upvalueindex(1));
+    cfg = (json_config_t *)lua_touserdata(l, lua_upvalueindex(1));
     if (!cfg)
         luaL_error(l, "BUG: Unable to fetch CJSON configuration");
 
@@ -223,7 +233,7 @@ static int json_integer_option(lua_State *l, int optindex, int *setting,
     int value;
 
     if (!lua_isnil(l, optindex)) {
-        value = (int)luaL_checkinteger(l, optindex);
+        value = luaL_checkinteger(l, optindex);
         snprintf(errmsg, sizeof(errmsg), "expected integer between %d and %d", min, max);
         luaL_argcheck(l, min <= value && value <= max, 1, errmsg);
         *setting = value;
@@ -298,7 +308,7 @@ static int json_cfg_encode_number_precision(lua_State *l)
 {
     json_config_t *cfg = json_arg_init(l, 1);
 
-    return json_integer_option(l, 1, &cfg->encode_number_precision, 1, 14);
+    return json_integer_option(l, 1, &cfg->encode_number_precision, 1, 16);
 }
 
 /* Configures JSON encoding buffer persistence */
@@ -357,11 +367,17 @@ static int json_cfg_decode_invalid_numbers(lua_State *l)
     return 1;
 }
 
+static int json_cfg_encode_empty_tables_as_array(lua_State *l)
+{
+    json_config_t *cfg = json_arg_init(l, 1);
+    return json_enum_option(l, 1, &cfg->encode_empty_table_as_array, NULL, 1);
+}
+
 static int json_destroy_config(lua_State *l)
 {
     json_config_t *cfg;
 
-    cfg = lua_touserdata(l, 1);
+    cfg = (json_config_t *)lua_touserdata(l, 1);
     if (cfg)
         strbuf_free(&cfg->encode_buf);
     cfg = NULL;
@@ -374,7 +390,7 @@ static void json_create_config(lua_State *l)
     json_config_t *cfg;
     int i;
 
-    cfg = lua_newuserdata(l, sizeof(*cfg));
+    cfg = (json_config_t *)lua_newuserdata(l, sizeof(*cfg));
 
     /* Create GC method to clean up strbuf */
     lua_newtable(l);
@@ -391,6 +407,7 @@ static void json_create_config(lua_State *l)
     cfg->decode_invalid_numbers = DEFAULT_DECODE_INVALID_NUMBERS;
     cfg->encode_keep_buffer = DEFAULT_ENCODE_KEEP_BUFFER;
     cfg->encode_number_precision = DEFAULT_ENCODE_NUMBER_PRECISION;
+    cfg->encode_empty_table_as_array = DEFAULT_ENCODE_EMPTY_TABLE_AS_ARRAY;
 
 #if DEFAULT_ENCODE_KEEP_BUFFER > 0
     strbuf_init(&cfg->encode_buf, 0);
@@ -462,9 +479,9 @@ static void json_encode_exception(lua_State *l, json_config_t *cfg, strbuf_t *js
 static void json_append_string(lua_State *l, strbuf_t *json, int lindex)
 {
     const char *escstr;
-    int i;
     const char *str;
     size_t len;
+    size_t i;
 
     str = lua_tolstring(l, lindex, &len);
 
@@ -576,7 +593,7 @@ static void json_append_array(lua_State *l, json_config_t *cfg, int current_dept
         else
             comma = 1;
 
-        lua_rawgeti(l, -1, i);
+        lua_geti(l, -1, i);
         json_append_data(l, cfg, current_depth, json);
         lua_pop(l, 1);
     }
@@ -587,18 +604,35 @@ static void json_append_array(lua_State *l, json_config_t *cfg, int current_dept
 static void json_append_number(lua_State *l, json_config_t *cfg,
                                strbuf_t *json, int lindex)
 {
-    double num = lua_tonumber(l, lindex);
     int len;
+#if LUA_VERSION_NUM >= 503
+    if (lua_isinteger(l, lindex)) {
+        lua_Integer num = lua_tointeger(l, lindex);
+        strbuf_ensure_empty_length(json, FPCONV_G_FMT_BUFSIZE); /* max length of int64 is 19 */
+        len = sprintf(strbuf_empty_ptr(json), LUA_INTEGER_FMT, num);
+        strbuf_extend_length(json, len);
+        return;
+    }
+#endif
+    double num = lua_tonumber(l, lindex);
 
     if (cfg->encode_invalid_numbers == 0) {
         /* Prevent encoding invalid numbers */
         if (isinf(num) || isnan(num))
-            json_encode_exception(l, cfg, json, lindex, "must not be NaN or Inf");
+            json_encode_exception(l, cfg, json, lindex,
+                                  "must not be NaN or Infinity");
     } else if (cfg->encode_invalid_numbers == 1) {
-        /* Encode invalid numbers, but handle "nan" separately
-         * since some platforms may encode as "-nan". */
+        /* Encode NaN/Infinity separately to ensure Javascript compatible
+         * values are used. */
         if (isnan(num)) {
-            strbuf_append_mem(json, "nan", 3);
+            strbuf_append_mem(json, "NaN", 3);
+            return;
+        }
+        if (isinf(num)) {
+            if (num < 0)
+                strbuf_append_mem(json, "-Infinity", 9);
+            else
+                strbuf_append_mem(json, "Infinity", 8);
             return;
         }
     } else {
@@ -677,11 +711,22 @@ static void json_append_data(lua_State *l, json_config_t *cfg,
     case LUA_TTABLE:
         current_depth++;
         json_check_encode_depth(l, cfg, current_depth, json);
-        len = lua_array_length(l, cfg, json);
-        if (len > 0)
+        if (luaL_getmetafield(l, -1, "__len") != LUA_TNIL) {
+            lua_pushvalue(l, -2);
+            lua_call(l, 1, 1);
+            if (!lua_isinteger(l, -1)) {
+                luaL_error(l, "__len should return integer");
+            }
+            len = lua_tointeger(l, -1);
+            lua_pop(l, 1);
             json_append_array(l, cfg, current_depth, json, len);
-        else
-            json_append_object(l, cfg, current_depth, json);
+        } else {
+            len = lua_array_length(l, cfg, json);
+            if (len > 0 || (cfg->encode_empty_table_as_array && len == 0))
+                json_append_array(l, cfg, current_depth, json, len);
+            else
+                json_append_object(l, cfg, current_depth, json);
+        }
         break;
     case LUA_TNIL:
         strbuf_append_mem(json, "null", 4);
@@ -995,13 +1040,18 @@ static int json_is_invalid_number(json_parse_t *json)
 static void json_next_number_token(json_parse_t *json, json_token_t *token)
 {
     char *endptr;
-
-    token->type = T_NUMBER;
-    token->value.number = fpconv_strtod(json->ptr, &endptr);
-    if (json->ptr == endptr)
+    token->value.integer = strtoll(json->ptr, &endptr, 0);
+    if (json->ptr == endptr) {
         json_set_token_error(token, json, "invalid number");
-    else
-        json->ptr = endptr;     /* Skip the processed number */
+        return;
+    }
+    if (*endptr == '.' || *endptr == 'e' || *endptr == 'E') {
+        token->type = T_NUMBER;
+        token->value.number = fpconv_strtod(json->ptr, &endptr);
+    } else {
+        token->type = T_INTEGER;
+    }
+    json->ptr = endptr;     /* Skip the processed number */
 
     return;
 }
@@ -1230,6 +1280,9 @@ static void json_process_value(lua_State *l, json_parse_t *json,
     case T_NUMBER:
         lua_pushnumber(l, token->value.number);
         break;;
+    case T_INTEGER:
+        lua_pushinteger(l, token->value.integer);
+        break;;
     case T_BOOLEAN:
         lua_pushboolean(l, token->value.boolean);
         break;;
@@ -1291,8 +1344,7 @@ static int json_decode(lua_State *l)
 
 /* ===== INITIALISATION ===== */
 
-#if !defined(LUA_JITLIBNAME) && LUA_VERSION_NUM == 501
-// #if 0
+#if !defined(LUA_VERSION_NUM) || LUA_VERSION_NUM < 502
 /* Compatibility for Lua 5.1.
  *
  * luaL_setfuncs() is used to create a module table where the functions have
@@ -1302,13 +1354,13 @@ static void luaL_setfuncs (lua_State *l, const luaL_Reg *reg, int nup)
     int i;
 
     luaL_checkstack(l, nup, "too many upvalues");
-    for (; reg->name != NULL; reg++) {  
-        for (i = 0; i < nup; i++)  
+    for (; reg->name != NULL; reg++) {  /* fill the table with given functions */
+        for (i = 0; i < nup; i++)  /* copy upvalues to the top */
             lua_pushvalue(l, -nup);
-        lua_pushcclosure(l, reg->func, nup);  
+        lua_pushcclosure(l, reg->func, nup);  /* closure with those upvalues */
         lua_setfield(l, -(nup + 2), reg->name);
     }
-    lua_pop(l, nup);  
+    lua_pop(l, nup);  /* remove upvalues */
 }
 #endif
 
@@ -1353,6 +1405,7 @@ static int lua_cjson_new(lua_State *l)
         { "encode_keep_buffer", json_cfg_encode_keep_buffer },
         { "encode_invalid_numbers", json_cfg_encode_invalid_numbers },
         { "decode_invalid_numbers", json_cfg_decode_invalid_numbers },
+        { "encode_empty_table_as_array", json_cfg_encode_empty_tables_as_array },
         { "new", lua_cjson_new },
         { NULL, NULL }
     };
@@ -1401,7 +1454,7 @@ static int lua_cjson_safe_new(lua_State *l)
     return 1;
 }
 
-int luaopen_cjson(lua_State *l)
+CJSON_EXPORT int luaopen_cjson(lua_State *l)
 {
     lua_cjson_new(l);
 
@@ -1415,7 +1468,7 @@ int luaopen_cjson(lua_State *l)
     return 1;
 }
 
-int luaopen_cjson_safe(lua_State *l)
+CJSON_EXPORT int luaopen_cjson_safe(lua_State *l)
 {
     lua_cjson_safe_new(l);
 

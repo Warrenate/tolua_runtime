@@ -124,7 +124,7 @@ double fpconv_strtod(const char *nptr, char **endptr)
     /* Duplicate number into buffer */
     if (buflen >= FPCONV_G_FMT_BUFSIZE) {
         /* Handle unusually large numbers */
-        buf = malloc(buflen + 1);
+        buf = (char *)malloc(buflen + 1);
         if (!buf) {
             fprintf(stderr, "Out of memory");
             abort();
@@ -154,7 +154,7 @@ static void set_number_format(char *fmt, int precision)
 {
     int d1, d2, i;
 
-    assert(1 <= precision && precision <= 14);
+    assert(1 <= precision && precision <= 16);
 
     /* Create printf format (%.14g) from precision */
     d1 = precision / 10;
